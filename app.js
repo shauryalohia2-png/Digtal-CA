@@ -1404,11 +1404,12 @@ function calculateTax() {
 // -------------------------------------------------------------
 // AI COPILOT INTERACTIVE WIDGET (Online & Autonomous Offline)
 // -------------------------------------------------------------
-function buildAssistantMessage(role, content) {
+function buildAssistantMessage(role, content, model = '') {
   const item = document.createElement('div');
   item.className = `assistant-msg ${role}`;
+  const engine = role === 'user' ? '' : engineLabel(model);
   item.innerHTML = `
-    <div class="assistant-msg-label">${role === 'user' ? 'You' : 'Digital CA AI Copilot ✦'}</div>
+    <div class="assistant-msg-label">${role === 'user' ? 'You' : `Digital CA AI Copilot ✦${engine ? ` · ${escapeHtml(engine)}` : ''}`}</div>
     <div class="assistant-msg-content">${formatMarkdownText(content)}</div>
   `;
   return item;
@@ -1424,11 +1425,11 @@ function formatMarkdownText(t) {
     .replace(/\n/g, '<br>');
 }
 
-function addAssistantMessage(role, content) {
+function addAssistantMessage(role, content, model = '') {
   const messages = document.getElementById('assistantMessages');
   if (!messages) return;
-  state.assistantMessages.push({ role, content });
-  messages.appendChild(buildAssistantMessage(role, content));
+  state.assistantMessages.push({ role, content, model });
+  messages.appendChild(buildAssistantMessage(role, content, model));
   messages.scrollTop = messages.scrollHeight;
 }
 
@@ -1454,7 +1455,7 @@ async function loadAssistantHistory() {
   if (saved.length) {
     state.assistantMessages = saved;
     messages.innerHTML = '';
-    saved.forEach(item => messages.appendChild(buildAssistantMessage(item.role, item.content)));
+    saved.forEach(item => messages.appendChild(buildAssistantMessage(item.role, item.content, item.model)));
   } else {
     messages.innerHTML = `
       <div class="assistant-msg assistant">
@@ -1575,6 +1576,39 @@ function ensureAssistantWidget() {
   document.getElementById('assistantForm')?.addEventListener('submit', sendAssistantMessage);
 }
 
+const EXPENSE_COMMAND_RE = /(?:spent|paid|bought|expense(?: of)?|pay) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: (?:on|for) ([\w\s&'-]+))?/i;
+const EXPENSE_COST_RE = /([\w\s&'-]+) (?:cost|bill(?: was| of)?) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)/i;
+const INCOME_COMMAND_RE = /(?:received|earned|salary|credited|income(?: of)?) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: from ([\w\s&'-]+))?/i;
+const CLIENT_PAYMENT_RE = /client payment (?:of )?(?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: from ([\w\s&'-]+))?/i;
+
+// Ledger commands are handled by the built-in engine (it can write to the ledger; a cloud LLM cannot)
+function isLedgerCommand(message) {
+  const lower = message.toLowerCase();
+  return Boolean(parseBudgetCommand(message) || parseGoalCommand(message)
+    || [EXPENSE_COMMAND_RE, EXPENSE_COST_RE, INCOME_COMMAND_RE, CLIENT_PAYMENT_RE].some(re => re.test(lower)));
+}
+
+// Totals the cloud AI uses to personalise answers when the server has no stored ledger
+function assistantContextSummary() {
+  const t = dashboardTotals();
+  const groups = {};
+  visibleTxs().filter(x => x.type === 'expense').forEach(x => {
+    groups[x.category || 'Other'] = (groups[x.category || 'Other'] || 0) + Number(x.amount || 0);
+  });
+  return {
+    income: t.income,
+    expense: t.expense,
+    topCategories: Object.entries(groups).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([name, amount]) => ({ name, amount }))
+  };
+}
+
+function engineLabel(model) {
+  if (!model) return '';
+  if (/gemini/i.test(model)) return 'Gemini';
+  if (/gpt|openai/i.test(model)) return 'OpenAI';
+  return 'Built-in engine';
+}
+
 // Client-side Autonomous Financial Reasoning Engine
 async function runClientAutonomousCA(message) {
   const lower = message.toLowerCase();
@@ -1620,8 +1654,7 @@ async function runClientAutonomousCA(message) {
   }
 
   // Natural language transaction: add expense
-  const expenseMatch = lower.match(/(?:spent|paid|bought|expense(?: of)?|pay) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: (?:on|for) ([\w\s&'-]+))?/i)
-    || lower.match(/([\w\s&'-]+) (?:cost|was|bill) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)/i);
+  const expenseMatch = lower.match(EXPENSE_COMMAND_RE) || lower.match(EXPENSE_COST_RE);
   if (expenseMatch) {
     const rawNum = expenseMatch[1] && !isNaN(Number(expenseMatch[1].replace(/,/g, ''))) ? expenseMatch[1] : expenseMatch[2];
     const rawDesc = expenseMatch[1] === rawNum ? (expenseMatch[2] || 'Direct Spend') : expenseMatch[1];
@@ -1645,8 +1678,7 @@ async function runClientAutonomousCA(message) {
   }
 
   // Natural language transaction: add income
-  const incomeMatch = lower.match(/(?:received|earned|salary|credited|income(?: of)?) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: from ([\w\s&'-]+))?/i)
-    || lower.match(/client payment (?:of )?(?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: from ([\w\s&'-]+))?/i);
+  const incomeMatch = lower.match(INCOME_COMMAND_RE) || lower.match(CLIENT_PAYMENT_RE);
   if (incomeMatch) {
     const rawNum = incomeMatch[1];
     const amount = Number(String(rawNum).replace(/,/g, ''));
@@ -1849,6 +1881,12 @@ async function sendAssistantMessage(event) {
 
   if (!message) return;
 
+  // Earlier turns (without the message being sent) give the cloud AI conversation context
+  const history = state.assistantMessages
+    .filter(m => (m.role === 'user' || m.role === 'assistant') && m.content)
+    .slice(-12)
+    .map(m => ({ role: m.role, content: m.content }));
+
   input.value = '';
   send.disabled = true;
   addAssistantMessage('user', message);
@@ -1858,6 +1896,9 @@ async function sendAssistantMessage(event) {
 
   try {
     let reply = '';
+    let model = '';
+
+    // 1. Signed in: the server stores history, runs ledger commands and asks the cloud AI
     if (state.user && isServerAvailable) {
       try {
         const result = await apiFetch('/api/assistant', {
@@ -1865,19 +1906,36 @@ async function sendAssistantMessage(event) {
           body: JSON.stringify({ message })
         });
         reply = result.reply;
+        model = result.model;
         await loadAuthenticatedData();
         renderAll();
       } catch (err) {
-        // Fallback to client engine
-        reply = await runClientAutonomousCA(message);
+        // Session lost (e.g. serverless restart) or server error: continue below
+        if (!state.user) updateAuthUI();
       }
-    } else {
+    }
+
+    // 2. Guests / lost sessions: questions go to the stateless cloud AI endpoint
+    if (!reply && !isLedgerCommand(message) && isServerAvailable) {
+      try {
+        const result = await apiFetch('/api/assistant/guest', {
+          method: 'POST',
+          body: JSON.stringify({ message, history, summary: assistantContextSummary() })
+        });
+        reply = result.reply;
+        model = result.model;
+      } catch {}
+    }
+
+    // 3. Ledger commands, offline mode, or no cloud AI configured: built-in engine
+    if (!reply) {
       reply = await runClientAutonomousCA(message);
+      model = 'digital-ca-neural-core';
     }
 
     state.assistantMessages.pop();
     if (pending) pending.remove();
-    addAssistantMessage('assistant', reply);
+    addAssistantMessage('assistant', reply, model);
 
     // Save locally
     writeJson('digitalca_assistant_history_guest', state.assistantMessages.slice(-30));

@@ -831,6 +831,15 @@ function parseGoalCommand(message) {
   return { name, targetAmount, targetDate };
 }
 
+const EXPENSE_COMMAND_RE = /(?:spent|paid|bought|expense of|add expense) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: (?:on|for) ([\w\s&'-]+?))?(?: (?:via|by|using|with) [\w\s]+)?$/i;
+const INCOME_COMMAND_RE = /(?:received|earned|salary|credited|income of) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: from ([\w\s&'-]+))?/i;
+
+// Ledger commands are executed by the built-in engine, never sent to an LLM (which can't write to the ledger)
+function isLedgerCommand(message) {
+  const lower = message.toLowerCase();
+  return Boolean(parseBudgetCommand(message) || parseGoalCommand(message) || EXPENSE_COMMAND_RE.test(lower) || INCOME_COMMAND_RE.test(lower));
+}
+
 // Comprehensive Indian CA Expert Engine (Zero API Key Dependency & Fallback)
 function generateAutonomousCAReply(userId, message) {
   const lower = message.toLowerCase();
@@ -859,7 +868,7 @@ function generateAutonomousCAReply(userId, message) {
   }
 
   // Command: Add Expense
-  const expenseMatch = lower.match(/(?:spent|paid|bought|expense of|add expense) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: (?:on|for) ([\w\s&'-]+?))?(?: (?:via|by|using|with) [\w\s]+)?$/i);
+  const expenseMatch = lower.match(EXPENSE_COMMAND_RE);
   if (expenseMatch) {
     const amount = Number(expenseMatch[1].replace(/,/g, ''));
     const merchant = (expenseMatch[2] || 'Unspecified').trim();
@@ -882,7 +891,7 @@ function generateAutonomousCAReply(userId, message) {
   }
 
   // Command: Add Income
-  const incomeMatch = lower.match(/(?:received|earned|salary|credited|income of) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: from ([\w\s&'-]+))?/i);
+  const incomeMatch = lower.match(INCOME_COMMAND_RE);
   if (incomeMatch) {
     const amount = Number(incomeMatch[1].replace(/,/g, ''));
     const source = (incomeMatch[2] || 'Salary / Client').trim();
@@ -1072,111 +1081,170 @@ I can help you monitor, manage, and optimize your finances with certified accoun
 What financial area would you like to focus on today?`;
 }
 
-// Call Google Gemini API (if key present)
+const AUTONOMOUS_MODEL = 'digital-ca-neural-core-v2';
+
+function geminiKey() {
+  return process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+}
+
+function cloudAIConfigured() {
+  return Boolean(geminiKey() || process.env.OPENAI_API_KEY);
+}
+
+// Chat history for the LLM: valid roles only, must start with the user, and
+// consecutive same-role turns merged (Gemini expects alternating turns)
+function normalizeTurns(messages) {
+  const turns = [];
+  for (const m of messages || []) {
+    const role = m?.role === 'assistant' ? 'assistant' : m?.role === 'user' ? 'user' : null;
+    const content = String(m?.content || '').trim().slice(0, 4000);
+    if (!role || !content) continue;
+    if (!turns.length && role !== 'user') continue;
+    const last = turns[turns.length - 1];
+    if (last && last.role === role) last.content += `\n\n${content}`;
+    else turns.push({ role, content });
+  }
+  const recent = turns.slice(-MAX_CHAT_HISTORY);
+  while (recent.length && recent[0].role !== 'user') recent.shift();
+  return recent;
+}
+
+function buildSystemPrompt(summary) {
+  const top = (summary.top_expense_categories || []).map(c => `${c.name}: ₹${Number(c.amount || 0).toLocaleString('en-IN')}`).join(', ') || 'none recorded';
+  return `You are Digital CA, a knowledgeable Indian Chartered Accountant and personal finance advisor inside a personal finance app.
+The user's recorded finances:
+- Total income: ₹${Number(summary.total_income || 0).toLocaleString('en-IN')}
+- Total expenses: ₹${Number(summary.total_expenses || 0).toLocaleString('en-IN')}
+- Net surplus: ₹${Number(summary.total_surplus || 0).toLocaleString('en-IN')}
+- Savings rate: ${Number(summary.savings_rate || 0).toFixed(1)}%
+- Top expense categories: ${top}
+Give structured, practical, accurate advice grounded in Indian rules (AY 2026-27 tax slabs, RBI, SEBI). Use short markdown sections and bullet points.
+You cannot record transactions yourself; if the user wants to log one, tell them to type e.g. "Spent 450 on coffee" or "Salary credited 85000".`;
+}
+
+// Call Google Gemini API
 async function callGeminiApi(apiKey, messages, systemPrompt) {
   const contents = messages.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }]
   }));
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
   const payload = {
     contents,
     systemInstruction: { parts: [{ text: systemPrompt }] },
     generationConfig: {
       temperature: 0.3,
-      maxOutputTokens: 1400
+      maxOutputTokens: 2048,
+      // 2.5 "thinking" tokens count against maxOutputTokens and can leave no visible text
+      ...(/2\.5-flash/.test(GEMINI_MODEL) ? { thinkingConfig: { thinkingBudget: 0 } } : {})
     }
   };
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    // Key in a header, not the URL, so it never shows up in logged error messages
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(25000)
   });
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${err}`);
+    throw new Error(`Gemini API error ${res.status}: ${err.slice(0, 500)}`);
   }
 
   const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error('No response text generated by Gemini.');
+  const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
+  if (!text) throw new Error(`No response text generated by Gemini (finishReason: ${data.candidates?.[0]?.finishReason || data.promptFeedback?.blockReason || 'unknown'}).`);
   return text;
 }
 
-// Assistant Endpoint
-app.post('/api/assistant', requireAuth, rateLimit(60), async (req, res) => {
-  const message = String(req.body?.message || '').trim().slice(0, 4000);
-  if (!message) return res.status(400).json({ error: 'Message is required.' });
+// Tries Gemini, then OpenAI. Returns null when neither is configured or both fail.
+async function askCloudAI(turns, summary) {
+  const systemPrompt = buildSystemPrompt(summary);
 
-  const userId = req.user.id;
-  const now = new Date().toISOString();
-
-  // Record user message
-  db.prepare('INSERT INTO ai_messages(user_id, role, content, created_at) VALUES(?,?,?,?)')
-    .run(userId, 'user', message, now);
-
-  const prior = db.prepare('SELECT role, content FROM ai_messages WHERE user_id=? ORDER BY id DESC LIMIT ?')
-    .all(userId, MAX_CHAT_HISTORY).reverse();
-
-  let finalText = '';
-  let usedModel = 'digital-ca-neural-core';
-
-  const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-  const openaiKey = process.env.OPENAI_API_KEY;
-
-  // Tier 1: Try Gemini API if configured
-  if (geminiKey) {
+  if (geminiKey()) {
     try {
-      const summary = financialSummary(userId, false);
-      const systemPrompt = `You are Digital CA, an elite, highly knowledgeable Indian Chartered Accountant and personal finance advisor. 
-Context of user:
-- Total Income: ₹${summary.total_income}
-- Total Expenses: ₹${summary.total_expenses}
-- Net Surplus: ₹${summary.total_surplus}
-- Savings Rate: ${summary.savings_rate.toFixed(1)}%
-- Top Categories: ${JSON.stringify(summary.top_expense_categories)}
-Always provide structured, actionable, and accurate advice grounded in Indian financial rules (AY 2026-27 tax slabs, RBI digital payments, SEBI guidelines). Use bullet points and markdown.`;
-
-      finalText = await callGeminiApi(geminiKey, prior, systemPrompt);
-      usedModel = GEMINI_MODEL;
+      return { text: await callGeminiApi(geminiKey(), turns, systemPrompt), model: GEMINI_MODEL };
     } catch (err) {
       console.warn('Gemini API call failed, falling back to next engine:', err.message);
     }
   }
 
-  // Tier 2: Try OpenAI if Gemini not configured or failed
-  if (!finalText && openaiKey) {
+  if (process.env.OPENAI_API_KEY) {
     try {
-      const client = new OpenAI({ apiKey: openaiKey });
+      const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       const completion = await client.chat.completions.create({
         model: OPENAI_MODEL,
-        messages: [
-          { role: 'system', content: 'You are Digital CA, an expert Indian Chartered Accountant and wealth advisor. Provide structured, precise financial advice based on AY 2026-27 rules.' },
-          ...prior.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }))
-        ],
+        messages: [{ role: 'system', content: systemPrompt }, ...turns],
         max_tokens: 1200
       });
-      finalText = completion.choices?.[0]?.message?.content || '';
-      usedModel = OPENAI_MODEL;
+      const text = completion.choices?.[0]?.message?.content || '';
+      if (text) return { text, model: OPENAI_MODEL };
     } catch (err) {
       console.warn('OpenAI API call failed, falling back to autonomous engine:', err.message);
     }
   }
 
-  // Tier 3: Autonomous CA Neural Engine (Always reliable, 100% uptime)
-  if (!finalText) {
-    finalText = generateAutonomousCAReply(userId, message);
-    usedModel = 'digital-ca-neural-core-v2';
+  return null;
+}
+
+// Assistant Endpoint (signed-in users: history and ledger stored server-side)
+app.post('/api/assistant', requireAuth, rateLimit(60), async (req, res) => {
+  const message = String(req.body?.message || '').trim().slice(0, 4000);
+  if (!message) return res.status(400).json({ error: 'Message is required.' });
+
+  const userId = req.user.id;
+
+  db.prepare('INSERT INTO ai_messages(user_id, role, content, created_at) VALUES(?,?,?,?)')
+    .run(userId, 'user', message, new Date().toISOString());
+
+  let finalText = '';
+  let usedModel = AUTONOMOUS_MODEL;
+
+  if (!isLedgerCommand(message)) {
+    const prior = db.prepare('SELECT role, content FROM ai_messages WHERE user_id=? ORDER BY id DESC LIMIT ?')
+      .all(userId, MAX_CHAT_HISTORY).reverse();
+    const ai = await askCloudAI(normalizeTurns(prior), financialSummary(userId, false));
+    if (ai) {
+      finalText = ai.text;
+      usedModel = ai.model;
+    }
   }
 
-  // Record assistant reply
+  // Built-in engine: ledger commands, and the fallback when no cloud AI answers
+  if (!finalText) finalText = generateAutonomousCAReply(userId, message);
+
   db.prepare('INSERT INTO ai_messages(user_id, role, content, created_at) VALUES(?,?,?,?)')
     .run(userId, 'assistant', finalText, new Date().toISOString());
 
   res.json({ ok: true, reply: finalText, model: usedModel });
+});
+
+// Stateless assistant for guests and for sessions lost to serverless restarts:
+// the browser sends its own history and totals, nothing is stored server-side.
+app.post('/api/assistant/guest', rateLimit(60), async (req, res) => {
+  const message = String(req.body?.message || '').trim().slice(0, 4000);
+  if (!message) return res.status(400).json({ error: 'Message is required.' });
+  if (!cloudAIConfigured()) return res.status(503).json({ error: 'Cloud AI is not configured.' });
+
+  const history = Array.isArray(req.body?.history) ? req.body.history.slice(-MAX_CHAT_HISTORY) : [];
+  const s = req.body?.summary || {};
+  const income = Math.max(0, jsonSafeNumber(s.income));
+  const expense = Math.max(0, jsonSafeNumber(s.expense));
+  const summary = {
+    total_income: income,
+    total_expenses: expense,
+    total_surplus: income - expense,
+    savings_rate: income ? ((income - expense) / income) * 100 : 0,
+    top_expense_categories: (Array.isArray(s.topCategories) ? s.topCategories : []).slice(0, 6)
+      .map(c => ({ name: String(c?.name || 'Other').slice(0, 60), amount: Math.max(0, jsonSafeNumber(c?.amount)) }))
+  };
+
+  const ai = await askCloudAI(normalizeTurns([...history, { role: 'user', content: message }]), summary);
+  if (!ai) return res.status(502).json({ error: 'Cloud AI is temporarily unavailable.' });
+  res.json({ ok: true, reply: ai.text, model: ai.model });
 });
 
 app.get('/api/assistant/history', requireAuth, (req, res) => {
