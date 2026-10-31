@@ -11,7 +11,9 @@ const OpenAI = require('openai');
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+// Google's alias for its current Flash model, tried if the configured model is retired (404)
+const GEMINI_FALLBACK_MODEL = 'gemini-flash-latest';
 const IS_PROD = process.env.NODE_ENV === 'production';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 const MAX_CHAT_HISTORY = 16;
@@ -1122,22 +1124,29 @@ Give structured, practical, accurate advice grounded in Indian rules (AY 2026-27
 You cannot record transactions yourself; if the user wants to log one, tell them to type e.g. "Spent 450 on coffee" or "Salary credited 85000".`;
 }
 
+// "Thinking" tokens count against maxOutputTokens and can leave no visible text, so keep thinking minimal
+function geminiThinkingConfig(model) {
+  if (/^gemini-2\.5-flash/.test(model)) return { thinkingBudget: 0 };
+  if (/^gemini-[3-9]/.test(model)) return { thinkingLevel: 'low' };
+  return null;
+}
+
 // Call Google Gemini API
-async function callGeminiApi(apiKey, messages, systemPrompt) {
+async function callGeminiApi(apiKey, model, messages, systemPrompt) {
   const contents = messages.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }]
   }));
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const thinkingConfig = geminiThinkingConfig(model);
   const payload = {
     contents,
     systemInstruction: { parts: [{ text: systemPrompt }] },
     generationConfig: {
       temperature: 0.3,
-      maxOutputTokens: 2048,
-      // 2.5 "thinking" tokens count against maxOutputTokens and can leave no visible text
-      ...(/2\.5-flash/.test(GEMINI_MODEL) ? { thinkingConfig: { thinkingBudget: 0 } } : {})
+      maxOutputTokens: 4096,
+      ...(thinkingConfig ? { thinkingConfig } : {})
     }
   };
 
@@ -1151,7 +1160,9 @@ async function callGeminiApi(apiKey, messages, systemPrompt) {
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${err.slice(0, 500)}`);
+    const error = new Error(`Gemini API error ${res.status} (${model}): ${err.slice(0, 500)}`);
+    error.status = res.status;
+    throw error;
   }
 
   const data = await res.json();
@@ -1165,10 +1176,15 @@ async function askCloudAI(turns, summary) {
   const systemPrompt = buildSystemPrompt(summary);
 
   if (geminiKey()) {
-    try {
-      return { text: await callGeminiApi(geminiKey(), turns, systemPrompt), model: GEMINI_MODEL };
-    } catch (err) {
-      console.warn('Gemini API call failed, falling back to next engine:', err.message);
+    const models = [...new Set([GEMINI_MODEL, GEMINI_FALLBACK_MODEL])];
+    for (const model of models) {
+      try {
+        return { text: await callGeminiApi(geminiKey(), model, turns, systemPrompt), model };
+      } catch (err) {
+        console.warn('Gemini API call failed, falling back to next engine:', err.message);
+        // Only a missing/retired model (404) is worth retrying with the fallback alias
+        if (err.status !== 404) break;
+      }
     }
   }
 

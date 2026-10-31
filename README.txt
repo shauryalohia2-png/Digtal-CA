@@ -39,7 +39,7 @@ KEY UPGRADES & PROBLEM RESOLUTIONS
 
 3. CURED & ELEVATED ARTIFICIAL INTELLIGENCE (Always-On CA Intelligence)
    - Built-in multi-tier AI architecture:
-     * Tier 1: Google Gemini API (gemini-2.5-flash, configurable via GEMINI_MODEL) via native REST.
+     * Tier 1: Google Gemini API (gemini-3.8-flash, falls back to gemini-flash-latest; configurable via GEMINI_MODEL) via native REST.
      * Tier 2: OpenAI API (gpt-4o-mini).
      * Tier 3: Autonomous Digital CA Neural Engine (Built-in Indian Chartered Accountant
        reasoning core that runs 100% out-of-the-box with ZERO API keys required).
