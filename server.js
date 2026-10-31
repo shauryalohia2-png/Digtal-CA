@@ -12,8 +12,9 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-// Google's alias for its current Flash model, tried if the configured model is retired (404)
-const GEMINI_FALLBACK_MODEL = 'gemini-flash-latest';
+// Tried in order when a model is retired (404), out of quota (429) or overloaded (5xx/timeout).
+// Each Gemini model has its own free-tier quota, so a lighter model often still answers.
+const GEMINI_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
 const IS_PROD = process.env.NODE_ENV === 'production';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 const MAX_CHAT_HISTORY = 16;
@@ -834,12 +835,15 @@ function parseGoalCommand(message) {
 }
 
 const EXPENSE_COMMAND_RE = /(?:spent|paid|bought|expense of|add expense) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: (?:on|for) ([\w\s&'-]+?))?(?: (?:via|by|using|with) [\w\s]+)?$/i;
+// Bare amount: "500 on coffee", "₹1,200 for groceries via card"
+const EXPENSE_BARE_RE = /^(?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:rs|rupees|inr|₹)?\s+(?:on|for)\s+([\w\s&'-]+?)(?: (?:via|by|using|with) [\w\s]+)?$/i;
 const INCOME_COMMAND_RE = /(?:received|earned|salary|credited|income of) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: from ([\w\s&'-]+))?/i;
 
 // Ledger commands are executed by the built-in engine, never sent to an LLM (which can't write to the ledger)
 function isLedgerCommand(message) {
-  const lower = message.toLowerCase();
-  return Boolean(parseBudgetCommand(message) || parseGoalCommand(message) || EXPENSE_COMMAND_RE.test(lower) || INCOME_COMMAND_RE.test(lower));
+  const lower = message.trim().toLowerCase();
+  return Boolean(parseBudgetCommand(message) || parseGoalCommand(message)
+    || EXPENSE_COMMAND_RE.test(lower) || EXPENSE_BARE_RE.test(lower) || INCOME_COMMAND_RE.test(lower));
 }
 
 // Comprehensive Indian CA Expert Engine (Zero API Key Dependency & Fallback)
@@ -870,7 +874,7 @@ function generateAutonomousCAReply(userId, message) {
   }
 
   // Command: Add Expense
-  const expenseMatch = lower.match(EXPENSE_COMMAND_RE);
+  const expenseMatch = lower.match(EXPENSE_COMMAND_RE) || lower.trim().match(EXPENSE_BARE_RE);
   if (expenseMatch) {
     const amount = Number(expenseMatch[1].replace(/,/g, ''));
     const merchant = (expenseMatch[2] || 'Unspecified').trim();
@@ -1155,7 +1159,8 @@ async function callGeminiApi(apiKey, model, messages, systemPrompt) {
     // Key in a header, not the URL, so it never shows up in logged error messages
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(25000)
+    // Up to three models may be tried in one request; keep the total well inside Vercel's limit
+    signal: AbortSignal.timeout(15000)
   });
 
   if (!res.ok) {
@@ -1171,19 +1176,30 @@ async function callGeminiApi(apiKey, model, messages, systemPrompt) {
   return text;
 }
 
-// Tries Gemini, then OpenAI. Returns null when neither is configured or both fail.
+// Why a cloud AI call failed, in terms the copilot can explain to the user
+function aiFailureReason(err) {
+  if (err.status === 429) return 'quota';
+  if (err.status === 400 || err.status === 401 || err.status === 403) return 'config';
+  if (err.status === 404) return 'model';
+  return 'busy'; // 5xx, timeouts, network errors, empty replies
+}
+
+// Tries Gemini (with model fallbacks), then OpenAI.
+// Returns { text, model } on success, or { reason } when every engine failed.
 async function askCloudAI(turns, summary) {
   const systemPrompt = buildSystemPrompt(summary);
+  let reason = 'config';
 
   if (geminiKey()) {
-    const models = [...new Set([GEMINI_MODEL, GEMINI_FALLBACK_MODEL])];
+    const models = [...new Set([GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS])];
     for (const model of models) {
       try {
         return { text: await callGeminiApi(geminiKey(), model, turns, systemPrompt), model };
       } catch (err) {
         console.warn('Gemini API call failed, falling back to next engine:', err.message);
-        // Only a missing/retired model (404) is worth retrying with the fallback alias
-        if (err.status !== 404) break;
+        reason = aiFailureReason(err);
+        // A bad key or malformed request fails the same way on every model
+        if (reason === 'config') break;
       }
     }
   }
@@ -1198,12 +1214,14 @@ async function askCloudAI(turns, summary) {
       });
       const text = completion.choices?.[0]?.message?.content || '';
       if (text) return { text, model: OPENAI_MODEL };
+      reason = 'busy';
     } catch (err) {
       console.warn('OpenAI API call failed, falling back to autonomous engine:', err.message);
+      reason = aiFailureReason(err);
     }
   }
 
-  return null;
+  return { reason };
 }
 
 // Assistant Endpoint (signed-in users: history and ledger stored server-side)
@@ -1218,14 +1236,17 @@ app.post('/api/assistant', requireAuth, rateLimit(60), async (req, res) => {
 
   let finalText = '';
   let usedModel = AUTONOMOUS_MODEL;
+  let aiUnavailable = null;
 
-  if (!isLedgerCommand(message)) {
+  if (!isLedgerCommand(message) && cloudAIConfigured()) {
     const prior = db.prepare('SELECT role, content FROM ai_messages WHERE user_id=? ORDER BY id DESC LIMIT ?')
       .all(userId, MAX_CHAT_HISTORY).reverse();
     const ai = await askCloudAI(normalizeTurns(prior), financialSummary(userId, false));
-    if (ai) {
+    if (ai.text) {
       finalText = ai.text;
       usedModel = ai.model;
+    } else {
+      aiUnavailable = ai.reason;
     }
   }
 
@@ -1235,7 +1256,7 @@ app.post('/api/assistant', requireAuth, rateLimit(60), async (req, res) => {
   db.prepare('INSERT INTO ai_messages(user_id, role, content, created_at) VALUES(?,?,?,?)')
     .run(userId, 'assistant', finalText, new Date().toISOString());
 
-  res.json({ ok: true, reply: finalText, model: usedModel });
+  res.json({ ok: true, reply: finalText, model: usedModel, aiUnavailable });
 });
 
 // Stateless assistant for guests and for sessions lost to serverless restarts:
@@ -1243,7 +1264,7 @@ app.post('/api/assistant', requireAuth, rateLimit(60), async (req, res) => {
 app.post('/api/assistant/guest', rateLimit(60), async (req, res) => {
   const message = String(req.body?.message || '').trim().slice(0, 4000);
   if (!message) return res.status(400).json({ error: 'Message is required.' });
-  if (!cloudAIConfigured()) return res.status(503).json({ error: 'Cloud AI is not configured.' });
+  if (!cloudAIConfigured()) return res.status(503).json({ error: 'Cloud AI is not configured.', reason: 'not_configured' });
 
   const history = Array.isArray(req.body?.history) ? req.body.history.slice(-MAX_CHAT_HISTORY) : [];
   const s = req.body?.summary || {};
@@ -1259,7 +1280,7 @@ app.post('/api/assistant/guest', rateLimit(60), async (req, res) => {
   };
 
   const ai = await askCloudAI(normalizeTurns([...history, { role: 'user', content: message }]), summary);
-  if (!ai) return res.status(502).json({ error: 'Cloud AI is temporarily unavailable.' });
+  if (!ai.text) return res.status(502).json({ error: 'Cloud AI is temporarily unavailable.', reason: ai.reason });
   res.json({ ok: true, reply: ai.text, model: ai.model });
 });
 

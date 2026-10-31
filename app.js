@@ -191,7 +191,10 @@ async function apiFetch(url, options = {}) {
     }
 
     if (!response.ok) {
-      throw new Error(payload.error || 'Request failed.');
+      const error = new Error(payload.error || 'Request failed.');
+      error.status = response.status;
+      error.payload = payload;
+      throw error;
     }
 
     return payload;
@@ -1578,14 +1581,27 @@ function ensureAssistantWidget() {
 
 const EXPENSE_COMMAND_RE = /(?:spent|paid|bought|expense(?: of)?|pay) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: (?:on|for) ([\w\s&'-]+))?/i;
 const EXPENSE_COST_RE = /([\w\s&'-]+) (?:cost|bill(?: was| of)?) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)/i;
+// Bare amount: "500 on coffee", "₹1,200 for groceries via card"
+const EXPENSE_BARE_RE = /^(?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:rs|rupees|inr|₹)?\s+(?:on|for)\s+([\w\s&'-]+)$/i;
 const INCOME_COMMAND_RE = /(?:received|earned|salary|credited|income(?: of)?) (?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: from ([\w\s&'-]+))?/i;
 const CLIENT_PAYMENT_RE = /client payment (?:of )?(?:₹|rs\.? ?)?(\d+(?:,\d+)*(?:\.\d+)?)(?: from ([\w\s&'-]+))?/i;
 
 // Ledger commands are handled by the built-in engine (it can write to the ledger; a cloud LLM cannot)
 function isLedgerCommand(message) {
-  const lower = message.toLowerCase();
+  const lower = message.trim().toLowerCase();
   return Boolean(parseBudgetCommand(message) || parseGoalCommand(message)
-    || [EXPENSE_COMMAND_RE, EXPENSE_COST_RE, INCOME_COMMAND_RE, CLIENT_PAYMENT_RE].some(re => re.test(lower)));
+    || [EXPENSE_COMMAND_RE, EXPENSE_COST_RE, EXPENSE_BARE_RE, INCOME_COMMAND_RE, CLIENT_PAYMENT_RE].some(re => re.test(lower)));
+}
+
+// One-line explanation shown above a built-in answer when the cloud AI couldn't respond
+function aiUnavailableNote(reason) {
+  const why = {
+    quota: 'Gemini has hit its usage limit for now',
+    busy: 'Gemini is busy right now',
+    model: 'the configured Gemini model is unavailable',
+    config: 'the Gemini API key was rejected'
+  }[reason];
+  return why ? `*Note: ${why}, so this answer comes from the built-in CA engine. Try again in a minute for a Gemini answer.*\n\n` : '';
 }
 
 // Totals the cloud AI uses to personalise answers when the server has no stored ledger
@@ -1654,7 +1670,7 @@ async function runClientAutonomousCA(message) {
   }
 
   // Natural language transaction: add expense
-  const expenseMatch = lower.match(EXPENSE_COMMAND_RE) || lower.match(EXPENSE_COST_RE);
+  const expenseMatch = lower.match(EXPENSE_COMMAND_RE) || lower.trim().match(EXPENSE_BARE_RE) || lower.match(EXPENSE_COST_RE);
   if (expenseMatch) {
     const rawNum = expenseMatch[1] && !isNaN(Number(expenseMatch[1].replace(/,/g, ''))) ? expenseMatch[1] : expenseMatch[2];
     const rawDesc = expenseMatch[1] === rawNum ? (expenseMatch[2] || 'Direct Spend') : expenseMatch[1];
@@ -1897,6 +1913,7 @@ async function sendAssistantMessage(event) {
   try {
     let reply = '';
     let model = '';
+    let aiUnavailable = null;
 
     // 1. Signed in: the server stores history, runs ledger commands and asks the cloud AI
     if (state.user && isServerAvailable) {
@@ -1907,6 +1924,7 @@ async function sendAssistantMessage(event) {
         });
         reply = result.reply;
         model = result.model;
+        aiUnavailable = result.aiUnavailable;
         await loadAuthenticatedData();
         renderAll();
       } catch (err) {
@@ -1924,7 +1942,9 @@ async function sendAssistantMessage(event) {
         });
         reply = result.reply;
         model = result.model;
-      } catch {}
+      } catch (err) {
+        aiUnavailable = err.payload?.reason || null;
+      }
     }
 
     // 3. Ledger commands, offline mode, or no cloud AI configured: built-in engine
@@ -1932,6 +1952,9 @@ async function sendAssistantMessage(event) {
       reply = await runClientAutonomousCA(message);
       model = 'digital-ca-neural-core';
     }
+
+    // Say why the built-in engine answered instead of Gemini, so it doesn't look broken
+    if (aiUnavailable) reply = aiUnavailableNote(aiUnavailable) + reply;
 
     state.assistantMessages.pop();
     if (pending) pending.remove();
