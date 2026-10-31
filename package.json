@@ -6,10 +6,11 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check app.js && node --check server.js"
+    "build": "node scripts/build-static.js",
+    "check": "node --check app.js && node --check server.js && node --check api/index.js && node --check scripts/build-static.js"
   },
   "engines": {
-    "node": ">=22.5"
+    "node": "22.x"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

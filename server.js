@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
 const OpenAI = require('openai');
@@ -14,7 +15,12 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const IS_PROD = process.env.NODE_ENV === 'production';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 const MAX_CHAT_HISTORY = 16;
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const IS_VERCEL = Boolean(process.env.VERCEL);
+// Vercel functions can only write to the temp dir, and it does not persist between instances
+const DATA_DIR = process.env.DATA_DIR || (IS_VERCEL ? path.join(os.tmpdir(), 'digital-ca-data') : path.join(__dirname, 'data'));
+if (IS_VERCEL && !process.env.DATA_DIR) {
+  console.warn('Digital CA: SQLite is stored in the function temp dir on Vercel; accounts and ledgers reset when instances recycle.');
+}
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'digital-ca.sqlite');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -142,6 +148,8 @@ for (const user of db.prepare('SELECT id FROM users').all()) {
 }
 
 app.disable('x-powered-by');
+// Behind Vercel's proxy, use the client IP from X-Forwarded-For for rate limiting
+if (IS_VERCEL) app.set('trust proxy', 1);
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');

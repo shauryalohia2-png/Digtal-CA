@@ -91,3 +91,20 @@ OPTION B: Full Express & SQLite Backend
    node server.js
 4. Visit:
    http://localhost:3000
+
+OPTION C: Deploy to Vercel
+1. Import the GitHub repository in Vercel (or run `vercel` from this folder).
+   vercel.json already configures everything: no framework preset, build
+   command `npm run build`, output directory `public`, Node.js 22.x.
+2. (Optional) In Project Settings > Environment Variables add GEMINI_API_KEY
+   or OPENAI_API_KEY (and GEMINI_MODEL / OPENAI_MODEL if you want to override).
+3. Deploy. Static pages are served from Vercel's CDN; every /api/* request is
+   handled by the Express app through the serverless function in api/index.js.
+
+IMPORTANT - data persistence on Vercel:
+   Vercel functions have no permanent disk, so the SQLite database lives in the
+   function's temporary directory. Accounts, ledgers and chat history created
+   on the deployed site are lost whenever Vercel recycles an instance, and two
+   instances do not share data. Guest mode (browser localStorage) is unaffected.
+   For permanent multi-user storage, move the database to a hosted service
+   (e.g. Vercel Postgres / Neon, Turso, or Supabase).
